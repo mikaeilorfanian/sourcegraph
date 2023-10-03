@@ -48,7 +48,6 @@ import (
 	"github.com/sourcegraph/sourcegraph/internal/featureflag"
 	"github.com/sourcegraph/sourcegraph/internal/fileutil"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver/adapters"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver/gitdomain"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver/protocol"
 	"github.com/sourcegraph/sourcegraph/internal/gitserver/search"
@@ -340,6 +339,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/repo-clone", trace.WithRouteName("repo-clone", s.handleRepoClone))
 	mux.HandleFunc("/create-commit-from-patch-binary", trace.WithRouteName("create-commit-from-patch-binary", s.handleCreateCommitFromPatchBinary))
 	mux.HandleFunc("/disk-info", trace.WithRouteName("disk-info", s.handleDiskInfo))
+	mux.HandleFunc("/commands/get-object", trace.WithRouteName("commands/get-object", s.handleGetObject))
 	mux.HandleFunc("/ping", trace.WithRouteName("ping", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -358,32 +358,6 @@ func (s *Server) Handler() http.Handler {
 			http.StripPrefix("/git", s.gitServiceHandler()).ServeHTTP(rw, r)
 		},
 	)))
-
-	// Migration to hexagonal architecture starting here:
-	gitAdapter := &adapters.Git{
-		ReposDir:                s.ReposDir,
-		RecordingCommandFactory: s.RecordingCommandFactory,
-	}
-	getObjectService := gitdomain.GetObjectService{
-		RevParse:      gitAdapter.RevParse,
-		GetObjectType: gitAdapter.GetObjectType,
-	}
-	getObjectFunc := gitdomain.GetObjectFunc(func(ctx context.Context, repo api.RepoName, objectName string) (_ *gitdomain.GitObject, err error) {
-		// Tracing is server concern, so add it here. Once generics lands we should be
-		// able to create some simple wrappers
-		tr, ctx := trace.New(ctx, "GetObject",
-			attribute.String("objectName", objectName))
-		defer tr.EndWithErr(&err)
-
-		return getObjectService.GetObject(ctx, repo, objectName)
-	})
-
-	mux.HandleFunc("/commands/get-object", trace.WithRouteName("commands/get-object",
-		accesslog.HTTPMiddleware(
-			s.Logger.Scoped("commands/get-object.accesslog", "commands/get-object endpoint access log"),
-			conf.DefaultClient(),
-			handleGetObject(s.Logger.Scoped("commands/get-object", "handles get object"), getObjectFunc),
-		)))
 
 	// 🚨 SECURITY: This must be wrapped in headerXRequestedWithMiddleware.
 	return headerXRequestedWithMiddleware(mux)
@@ -1592,7 +1566,7 @@ func (s *Server) exec(ctx context.Context, logger log.Logger, req *protocol.Exec
 	// For searches over large repo sets (> 1k), this leads to too many child process execs, which can lead
 	// to a persistent failure mode where every exec takes > 10s, which is disastrous for gitserver performance.
 	if len(req.Args) == 2 && req.Args[0] == "rev-parse" && req.Args[1] == "HEAD" {
-		if resolved, err := quickRevParseHead(dir); err == nil && isAbsoluteRevision(resolved) {
+		if resolved, err := quickRevParseHead(dir); err == nil && gitdomain.IsAbsoluteRevision(resolved) {
 			_, _ = w.Write([]byte(resolved))
 			return execStatus{}, nil
 		}
@@ -2763,7 +2737,7 @@ func (s *Server) ensureRevision(ctx context.Context, repo api.RepoName, rev stri
 
 	// rev-parse on an OID does not check if the commit actually exists, so it always
 	// works. So we append ^0 to force the check
-	if isAbsoluteRevision(rev) {
+	if gitdomain.IsAbsoluteRevision(rev) {
 		rev = rev + "^0"
 	}
 	cmd := exec.Command("git", "rev-parse", rev, "--")
@@ -2792,7 +2766,7 @@ func quickSymbolicRefHead(dir common.GitDir) (string, error) {
 		return "", err
 	}
 	head = bytes.TrimSpace(head)
-	if isAbsoluteRevision(string(head)) {
+	if gitdomain.IsAbsoluteRevision(string(head)) {
 		return "", errors.New("ref HEAD is not a symbolic ref")
 	}
 
@@ -2813,7 +2787,7 @@ func quickRevParseHead(dir common.GitDir) (string, error) {
 		return "", err
 	}
 	head = bytes.TrimSpace(head)
-	if h := string(head); isAbsoluteRevision(h) {
+	if h := string(head); gitdomain.IsAbsoluteRevision(h) {
 		return h, nil
 	}
 
@@ -2866,22 +2840,119 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-// IsAbsoluteRevision checks if the revision is a git OID SHA string.
-//
-// Note: This doesn't mean the SHA exists in a repository, nor does it mean it
-// isn't a ref. Git allows 40-char hexadecimal strings to be references.
-//
-// copied from internal/vcs/git to avoid cyclic import
-func isAbsoluteRevision(s string) bool {
-	if len(s) != 40 {
-		return false
+func (s *Server) handleGetObject(w http.ResponseWriter, r *http.Request) {
+	var req protocol.GetObjectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, errors.Wrap(err, "decoding body").Error(), http.StatusBadRequest)
+		return
 	}
-	for _, r := range s {
-		if !(('0' <= r && r <= '9') ||
-			('a' <= r && r <= 'f') ||
-			('A' <= r && r <= 'F')) {
-			return false
+
+	// Log which actor is accessing the repo.
+	accesslog.Record(r.Context(), string(req.Repo), log.String("objectname", req.ObjectName))
+
+	obj, err := getObject(r.Context(), s.RecordingCommandFactory, s.ReposDir, getObjectType, revParse, req.Repo, req.ObjectName)
+	if err != nil {
+		http.Error(w, errors.Wrap(err, "getting object").Error(), http.StatusInternalServerError)
+		return
+	}
+
+	resp := protocol.GetObjectResponse{
+		Object: *obj,
+	}
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func getObject(ctx context.Context, rcf *wrexec.RecordingCommandFactory, reposDir string, getObjectType getObjectTypeFunc, revParse revParseFunc, repo api.RepoName, objectName string) (_ *gitdomain.GitObject, err error) {
+	tr, ctx := trace.New(ctx, "GetObject",
+		attribute.String("objectName", objectName))
+	defer tr.EndWithErr(&err)
+
+	if err := checkSpecArgSafety(objectName); err != nil {
+		return nil, err
+	}
+
+	dir := repoDirFromName(reposDir, repo)
+
+	sha, err := revParse(ctx, rcf, repo, dir, objectName)
+	if err != nil {
+		if gitdomain.IsRepoNotExist(err) {
+			return nil, err
 		}
+		if strings.Contains(sha, "unknown revision") {
+			return nil, &gitdomain.RevisionNotFoundError{Repo: repo, Spec: objectName}
+		}
+		return nil, err
 	}
-	return true
+
+	sha = strings.TrimSpace(sha)
+	if !gitdomain.IsAbsoluteRevision(sha) {
+		if sha == "HEAD" {
+			// We don't verify the existence of HEAD, but if HEAD doesn't point to anything
+			// git just returns `HEAD` as the output of rev-parse. An example where this
+			// occurs is an empty repository.
+			return nil, &gitdomain.RevisionNotFoundError{Repo: repo, Spec: objectName}
+		}
+		return nil, &gitdomain.BadCommitError{Spec: objectName, Commit: api.CommitID(sha), Repo: repo}
+	}
+
+	oid, err := decodeOID(sha)
+	if err != nil {
+		return nil, errors.Wrap(err, "decoding oid")
+	}
+
+	objectType, err := getObjectType(ctx, rcf, repo, dir, oid.String())
+	if err != nil {
+		return nil, errors.Wrap(err, "getting object type")
+	}
+
+	return &gitdomain.GitObject{
+		ID:   oid,
+		Type: objectType,
+	}, nil
+
+}
+
+type getObjectTypeFunc func(ctx context.Context, rcf *wrexec.RecordingCommandFactory, repo api.RepoName, dir common.GitDir, objectID string) (gitdomain.ObjectType, error)
+
+// getObjectType returns the object type given an objectID.
+func getObjectType(ctx context.Context, rcf *wrexec.RecordingCommandFactory, repo api.RepoName, dir common.GitDir, objectID string) (gitdomain.ObjectType, error) {
+	cmd := exec.Command("git", "cat-file", "-t", "--", objectID)
+	dir.Set(cmd)
+	wrappedCmd := rcf.WrapWithRepoName(context.Background(), log.NoOp(), repo, cmd)
+	out, err := wrappedCmd.CombinedOutput()
+	if err != nil {
+		return "", errors.WithMessage(err, fmt.Sprintf("git command %v failed (output: %q)", wrappedCmd.Args, out))
+	}
+
+	objectType := gitdomain.ObjectType(bytes.TrimSpace(out))
+	return objectType, nil
+}
+
+type revParseFunc func(ctx context.Context, rcf *wrexec.RecordingCommandFactory, repo api.RepoName, dir common.GitDir, rev string) (string, error)
+
+// revParse will run rev-parse on the given rev.
+func revParse(ctx context.Context, rcf *wrexec.RecordingCommandFactory, repo api.RepoName, dir common.GitDir, rev string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", rev)
+	dir.Set(cmd)
+	wrappedCmd := rcf.WrapWithRepoName(context.Background(), log.NoOp(), repo, cmd)
+	out, err := wrappedCmd.CombinedOutput()
+	if err != nil {
+		return "", errors.WithMessage(err, fmt.Sprintf("git command %v failed (output: %q)", wrappedCmd.Args, out))
+	}
+
+	return string(out), nil
+}
+
+func decodeOID(sha string) (gitdomain.OID, error) {
+	oidBytes, err := hex.DecodeString(sha)
+	if err != nil {
+		return gitdomain.OID{}, err
+	}
+	var oid gitdomain.OID
+	copy(oid[:], oidBytes)
+	return oid, nil
 }

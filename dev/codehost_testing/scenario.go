@@ -14,6 +14,9 @@ import (
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
+// action represents an action to perform against a codehost. Each action should provide
+// a name and functions to apply and optionally teardown the action. Where teardown destroys
+// the resource created in apply.
 type action struct {
 	name     string
 	apply    func(context.Context) error
